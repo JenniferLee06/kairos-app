@@ -1,16 +1,15 @@
-// backend/index.js (终版代码)
+// backend/index.js (升级到 PostgreSQL 的版本)
 
 const express = require('express');
 const cors = require('cors');
-const sqlite3 = require('sqlite3').verbose();
-const { open } = require('sqlite');
+const { Pool } = require('pg'); // 导入 pg 的 Pool
 const { nanoid } = require('nanoid');
 
-// --- ✍️ 文案中心 (Copywriting Center) ---
+// --- ✍️ 文案中心 (保持不变) ---
 const copy = {
-  APP_NAME: "Kairos", 
+  APP_NAME: "Kairos",
   INTERNAL_SERVER_ERROR: "服务器开小差了，请稍后再试。",
-  BACKEND_WELCOME: "欢迎来到 Kairos!", 
+  BACKEND_WELCOME: "欢迎来到 Kairos!",
   EVENT_CREATION_SUCCESS: "活动创建成功！",
   EVENT_CREATION_FAILED_VALIDATION: "活动标题和候选时间不能为空哦。",
   EVENT_NOT_FOUND: "哎呀，这个活动链接不存在或已失效。",
@@ -18,37 +17,43 @@ const copy = {
 };
 
 const app = express();
-const PORT = 4000;
-let db;
+// 让服务器使用 Render 提供的端口，或者在本地开发时使用 4000
+const PORT = process.env.PORT || 4000;
 
-(async () => {
-    db = await open({
-        filename: './database.db',
-        driver: sqlite3.Database
-    });
-    console.log('成功连接到 SQLite 数据库.');
+// 创建一个 PostgreSQL 连接池
+// 它会自动使用 Render 注入的 DATABASE_URL 环境变量
+const db = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  // 如果是部署在 Render 上，需要开启 SSL
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+});
 
-    await db.exec(`
+// 数据库初始化函数
+const initializeDb = async () => {
+  try {
+    // SQL 语法从 SQLite 改为 PostgreSQL
+    await db.query(`
         CREATE TABLE IF NOT EXISTS Events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             title TEXT NOT NULL,
             timeSlots TEXT NOT NULL,
             uniqueLink TEXT NOT NULL UNIQUE
         );
     `);
-
-    await db.exec(`
+    await db.query(`
         CREATE TABLE IF NOT EXISTS Votes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id SERIAL PRIMARY KEY,
             eventId INTEGER NOT NULL,
             participantName TEXT NOT NULL,
             selectedSlots TEXT NOT NULL,
             FOREIGN KEY (eventId) REFERENCES Events (id)
         );
     `);
-
     console.log('数据表已成功创建或已存在.');
-})();
+  } catch (err) {
+    console.error('初始化数据库时出错:', err);
+  }
+};
 
 app.use(cors());
 app.use(express.json());
@@ -65,13 +70,16 @@ app.post('/api/events', async (req, res) => {
             return res.status(400).json({ error: copy.EVENT_CREATION_FAILED_VALIDATION });
         }
         const uniqueLink = nanoid(10);
-        const result = await db.run(
-            'INSERT INTO Events (title, timeSlots, uniqueLink) VALUES (?, ?, ?)',
+        
+        // 查询语句从 db.run 改为 db.query
+        const result = await db.query(
+            'INSERT INTO Events (title, timeSlots, uniqueLink) VALUES ($1, $2, $3) RETURNING id',
             [title, JSON.stringify(timeSlots), uniqueLink]
         );
+        
         res.status(201).json({
             message: copy.EVENT_CREATION_SUCCESS,
-            eventId: result.lastID,
+            eventId: result.rows[0].id,
             uniqueLink: uniqueLink
         });
     } catch (error) {
@@ -84,7 +92,10 @@ app.post('/api/events', async (req, res) => {
 app.get('/api/events/:uniqueLink', async (req, res) => {
     try {
         const { uniqueLink } = req.params;
-        const event = await db.get('SELECT title, timeSlots FROM Events WHERE uniqueLink = ?', [uniqueLink]);
+        // 查询语句从 db.get 改为 db.query
+        const result = await db.query('SELECT title, timeSlots FROM Events WHERE uniqueLink = $1', [uniqueLink]);
+        const event = result.rows[0];
+        
         if (event) {
             res.json({
                 title: event.title,
@@ -104,14 +115,19 @@ app.post('/api/events/:uniqueLink/vote', async (req, res) => {
     try {
         const { uniqueLink } = req.params;
         const { participantName, selectedSlots } = req.body;
-        const event = await db.get('SELECT id FROM Events WHERE uniqueLink = ?', [uniqueLink]);
+        
+        const eventResult = await db.query('SELECT id FROM Events WHERE uniqueLink = $1', [uniqueLink]);
+        const event = eventResult.rows[0];
+
         if (!event) {
             return res.status(404).json({ error: copy.EVENT_NOT_FOUND });
         }
-        await db.run(
-            'INSERT INTO Votes (eventId, participantName, selectedSlots) VALUES (?, ?, ?)',
+        
+        await db.query(
+            'INSERT INTO Votes (eventId, participantName, selectedSlots) VALUES ($1, $2, $3)',
             [event.id, participantName, JSON.stringify(selectedSlots)]
         );
+        
         res.status(201).json({ message: copy.VOTE_SUCCESS });
     } catch (error) {
         console.error('提交投票时出错:', error);
@@ -119,7 +135,8 @@ app.post('/api/events/:uniqueLink/vote', async (req, res) => {
     }
 });
 
-
+// 启动服务器
 app.listen(PORT, () => {
   console.log(`服务器正在 http://localhost:${PORT} 上成功运行`);
+  initializeDb(); // 启动时初始化数据库
 });
